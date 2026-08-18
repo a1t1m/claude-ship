@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""
+ship-fanout: send N independent Claudes to break the work, keep what survives.
+
+Each lens is a real `claude -p` session with its own context. It cannot see the
+implementer's reasoning, so it cannot inherit the implementer's blind spots. A
+lens must reproduce what it claims: a finding without a repro command and its
+observed output is dropped as speculation before anyone reads it.
+
+Survivors are deduplicated across lenses, then each one is handed to a refuter
+whose job is to prove it wrong. What survives refutation is CONFIRMED and worth
+fixing. Everything else is noise that would have cost you an afternoon.
+
+    ship-fanout --out DIR [--repo DIR] [--base REF] [--lenses auto|a,b,c]
+                [--round N] [--concurrency N] [--timeout S] [--model M]
+                [--no-refute] [--list-lenses] [--plan-only]
+
+Writes  DIR/round-<N>/findings.json   every finding with its verdict
+        DIR/round-<N>/raw/<lens>.json the untouched lens output
+        DIR/round-<N>/summary.json    counts, per lens, for the gate
+
+Exit  0 nothing confirmed (a dry round)   1 confirmed findings exist
+      2 usage or environment problem
+
+Only the standard library, plus `claude` and `git` on PATH.
+"""
+
+import argparse
+import concurrent.futures
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+# ------------------------------------------------------------ lens catalog ---
+# `when` is a list of glob patterns matched against changed paths.
+# `always` lenses run on every round regardless of what changed.
+
+LENSES = [
+    {
+        "id": "functional",
+        "always": True,
+        "title": "does it actually do what the plan said",
+        "mandate": (
+            "Verify the change delivers what it claims. Read the plan or the commit "
+            "messages for the intent, then prove the intent holds by RUNNING things: "
+            "the test suite, the CLI, the endpoint, the app. Every claim you make must "
+            "come with the command you ran and the output you saw. Look hardest at the "
+            "gap between what the code appears to do and what it was asked to do."
+        ),
+    },
+    {
+        "id": "adversarial-edge",
+        "always": True,
+        "title": "the inputs nobody thought about",
+        "mandate": (
+            "Try to break it with input, not with opinion. Empty, null, zero, negative, "
+            "enormous, unicode, concurrent, out-of-order, duplicated, and repeated calls. "
+            "Boundary values on every loop and slice. What happens on the second call? "
+            "On a retry? When two run at once? Reproduce every break you claim."
+        ),
+    },
+    {
+        "id": "regression",
+        "always": True,
+        "title": "what used to work and might not now",
+        "mandate": (
+            "Assume the change broke something it never mentions. Find the callers of "
+            "every modified function and the consumers of every modified type. Run the "
+            "FULL existing suite, not just the new tests, and report anything that fails "
+            "or that was quietly deleted, skipped, or weakened."
+        ),
+    },
+    {
+        "id": "playwright-e2e",
+        "when": ["*.tsx", "*.jsx", "*.ts", "*.js", "*.vue", "*.svelte", "*.html",
+                 "*.astro", "*.css", "*.scss"],
+        "title": "drive the real browser",
+        "mandate": (
+            "Boot the app and drive it in a real browser. Find the dev server command in "
+            "package.json, start it, wait for it to answer, then walk the changed flows "
+            "as a user would. Use the Playwright MCP tools if they are available. Assert "
+            "on the accessibility tree, not on pixels. Report console errors, failed "
+            "network requests, dead buttons, and anything that needs a reload to work."
+        ),
+    },
+    {
+        "id": "a11y",
+        "when": ["*.tsx", "*.jsx", "*.vue", "*.svelte", "*.html", "*.astro"],
+        "title": "keyboard, screen reader, contrast",
+        "mandate": (
+            "Audit the changed UI against WCAG 2.2 AA. Tab through every new interactive "
+            "element in order and report anything unreachable, anything with no visible "
+            "focus ring, and any trap. Check names and roles on controls, label "
+            "association on inputs, heading order, and colour contrast on new tokens. "
+            "Run axe if it is already a project dependency; never install it yourself."
+        ),
+    },
+    {
+        "id": "visual",
+        "when": ["*.css", "*.scss", "*.tsx", "*.jsx", "*.vue", "*.svelte", "*.html"],
+        "title": "responsive and both themes",
+        "mandate": (
+            "Look at the changed UI at 375, 768, and 1440 wide, in light and dark. Report "
+            "horizontal body scroll, clipped or overlapping text, content escaping its "
+            "container, invisible text from a colour that was only defined for one theme, "
+            "and layout that collapses at the narrow width. Screenshot what you claim."
+        ),
+    },
+    {
+        "id": "emil-polish",
+        "when": ["*.tsx", "*.jsx", "*.vue", "*.svelte", "*.css", "*.scss"],
+        "title": "does it feel built or generated",
+        "mandate": (
+            "Judge interaction quality. Missing hover, active, focus, disabled, loading, "
+            "empty, and error states. Layout that jumps when data arrives. Animation that "
+            "is not interruptible, that animates a non-composited property, or that "
+            "ignores prefers-reduced-motion. Transitions slower than 200ms on anything the "
+            "user triggers directly. Name the specific element and the specific state."
+        ),
+    },
+    {
+        "id": "api-contract",
+        "when": ["*api*", "*route*", "*handler*", "*controller*", "*resolver*",
+                 "*endpoint*", "*.proto", "*openapi*", "*swagger*"],
+        "title": "the shape consumers depend on",
+        "mandate": (
+            "Exercise the changed endpoints for real. Check status codes, error shapes, "
+            "required and optional fields, null handling, pagination, and content types. "
+            "Flag any change that would break an existing consumer: a renamed or removed "
+            "field, a narrowed type, a new required input, a changed status code."
+        ),
+    },
+    {
+        "id": "migration-rollback",
+        "critical": True,
+        "when": ["*migration*", "*migrate*", "*schema*", "*.sql", "*models.py",
+                 "*entity*", "*prisma*"],
+        "title": "can you go back",
+        "mandate": (
+            "Run the migration forward, then roll it back, then forward again. Report any "
+            "step that is not reversible, that loses data, that locks a large table, or "
+            "that assumes an empty database. Check that the code tolerates both the old "
+            "and the new schema, since deploys are not atomic."
+        ),
+    },
+    {
+        "id": "security",
+        "critical": True,
+        "when": ["*auth*", "*login*", "*session*", "*token*", "*crypto*", "*password*",
+                 "*permission*", "*role*", "*acl*", "*payment*", "*billing*", "*upload*",
+                 "*admin*"],
+        "title": "who else can reach this",
+        "mandate": (
+            "Assume the caller is hostile and authenticated as someone else. Check "
+            "authorization on every new path, not just authentication. Look for IDOR, "
+            "missing ownership checks, injection through unparameterised queries or shell "
+            "calls, secrets in code or logs, unsafe deserialization, and user input "
+            "reaching a template or the filesystem. Prove reachability before you report."
+        ),
+    },
+    {
+        "id": "data-integrity",
+        "when": ["*model*", "*store*", "*repository*", "*.sql", "*dao*", "*db*"],
+        "title": "what the database is left holding",
+        "mandate": (
+            "Check what happens to the data when things go wrong halfway. Transaction "
+            "boundaries, partial writes, missing rollback, race between read and write, "
+            "orphaned rows, constraints that exist in code but not in the schema, and "
+            "writes that are not idempotent under retry."
+        ),
+    },
+]
+
+FINDINGS_CONTRACT = """
+Output format — this is not negotiable.
+
+Your entire final message must be ONE JSON object and nothing else. No preamble,
+no markdown fence, no commentary before or after.
+
+{"findings": [
+  {"title":        "one sentence naming the defect",
+   "severity":     "blocker" | "high" | "medium" | "low",
+   "file":         "path/to/file.ext",
+   "line":         123,
+   "repro":        "the exact command you ran",
+   "observed":     "what actually happened, quoted from the output",
+   "expected":     "what should have happened",
+   "why_it_matters": "the user-visible consequence"}
+]}
+
+Rules that decide whether your work counts:
+
+  * A finding with no `repro` command and no `observed` output is DISCARDED
+    unread. Do not report anything you did not reproduce.
+  * `observed` must be real output you saw, not a description of what you
+    think would happen. Paraphrasing your own prediction is fabrication.
+  * Style preferences, naming opinions, and "consider refactoring" are NOT
+    findings. Report defects.
+  * Finding nothing is a legitimate and useful result. Return
+    {"findings": []} rather than inventing something to justify the run.
+  * severity: blocker = data loss, security hole, or the feature does not
+    work. high = a user hits it on a normal path. medium = a user hits it on
+    an unusual path. low = cosmetic but real and reproducible.
+"""
+
+REFUTER_CONTRACT = """
+Output format — your entire final message must be ONE JSON object, nothing else.
+
+{"verdict": "confirmed" | "refuted", "reason": "one sentence", "evidence": "what you ran and saw"}
+
+Default to "refuted" when you cannot reproduce it. A finding that cannot be
+reproduced on demand is worth less than nothing: it costs someone an afternoon.
+"""
+
+
+# ------------------------------------------------------------------ helpers ---
+
+def die(msg, code=2):
+    sys.stderr.write("ship-fanout: %s\n" % msg)
+    sys.exit(code)
+
+
+def run(cmd, cwd=None, timeout=60):
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                              timeout=timeout)
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out"
+    except (OSError, FileNotFoundError) as exc:
+        return 127, "", str(exc)
+
+
+def detect_base(repo):
+    code, out, _ = run(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], cwd=repo)
+    if code == 0 and out.strip():
+        return out.strip().rsplit("/", 1)[-1]
+    for branch in ("main", "master", "develop"):
+        code, _, _ = run(["git", "rev-parse", "--verify", branch], cwd=repo)
+        if code == 0:
+            return branch
+    return "HEAD~1"
+
+
+def changed_files(repo, base):
+    seen = []
+    for cmd in (["git", "diff", "--name-only", "%s...HEAD" % base],
+                ["git", "diff", "--name-only", "HEAD"],
+                ["git", "ls-files", "--others", "--exclude-standard"]):
+        code, out, _ = run(cmd, cwd=repo)
+        if code == 0:
+            for line in out.splitlines():
+                line = line.strip()
+                if line and line not in seen:
+                    seen.append(line)
+    return seen
+
+
+def route(files, requested, cap=7):
+    """Pick lenses. `requested` is None for auto. Returns (picked, deferred)."""
+    by_id = {lens["id"]: lens for lens in LENSES}
+    if requested:
+        picked = []
+        for name in requested:
+            if name not in by_id:
+                die("unknown lens %r (see --list-lenses)" % name)
+            picked.append(by_id[name])
+        return picked, []
+
+    picked = [lens for lens in LENSES if lens.get("always")]
+    lowered = [f.lower() for f in files]
+    matched = []
+    for lens in LENSES:
+        if lens.get("always"):
+            continue
+        hits = 0
+        for pattern in lens.get("when", []):
+            hits += sum(1 for path in lowered
+                        if fnmatch.fnmatch(path, pattern)
+                        or fnmatch.fnmatch(os.path.basename(path), pattern))
+        if hits:
+            matched.append((hits, lens))
+
+    # A lens is ranked by how implicated it is, EXCEPT that a critical lens
+    # outranks any amount of file-count. Deferring `security` on a diff that
+    # touched auth because three UI files matched more globs is how a hole ships.
+    matched.sort(key=lambda pair: (1 if pair[1].get("critical") else 0, pair[0]),
+                 reverse=True)
+    room = max(0, cap - len(picked))
+    picked += [lens for _, lens in matched[:room]]
+    deferred = [lens["id"] for _, lens in matched[room:]]
+    return picked, deferred
+
+
+def extract_json(text):
+    """Pull the first balanced JSON object out of a model's reply."""
+    if not text:
+        return None
+    text = text.strip()
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
+    if fence:
+        text = fence.group(1)
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth, in_str, esc = 0, False, False
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:idx + 1])
+                except ValueError:
+                    return None
+    return None
+
+
+def claude_call(prompt, cwd, timeout, model=None, read_only=True):
+    """One headless Claude session. Returns (ok, parsed_json, raw_text)."""
+    cmd = ["claude", "-p", prompt, "--output-format", "json",
+           "--permission-mode", "bypassPermissions"]
+    if read_only:
+        cmd += ["--disallowed-tools", "Edit", "Write", "NotebookEdit"]
+    if model:
+        cmd += ["--model", model]
+    code, out, err = run(cmd, cwd=cwd, timeout=timeout)
+    if code == 124:
+        return False, None, "timed out after %ss" % timeout
+    if code == 127:
+        return False, None, "could not run claude: %s" % err
+    envelope = extract_json(out)
+    text = ""
+    if isinstance(envelope, dict) and "result" in envelope:
+        text = envelope.get("result") or ""
+    else:
+        text = out
+    return True, extract_json(text), text
+
+
+def fingerprint(finding):
+    path = (finding.get("file") or "").strip().lower()
+    line = finding.get("line") or 0
+    try:
+        bucket = int(line) // 10
+    except (TypeError, ValueError):
+        bucket = 0
+    words = re.findall(r"[a-z]{4,}", (finding.get("title") or "").lower())
+    stem = " ".join(sorted(set(words))[:6])
+    return hashlib.sha1(("%s|%s|%s" % (path, bucket, stem)).encode()).hexdigest()[:12]
+
+
+def valid(finding):
+    if not isinstance(finding, dict):
+        return False
+    if not (finding.get("title") or "").strip():
+        return False
+    if not (finding.get("repro") or "").strip():
+        return False
+    if not (finding.get("observed") or "").strip():
+        return False
+    return True
+
+
+# -------------------------------------------------------------------- main ---
+
+def lens_prompt(lens, repo, base, files, context):
+    listing = "\n".join("  " + f for f in files[:80])
+    if len(files) > 80:
+        listing += "\n  … and %d more" % (len(files) - 80)
+    return """You are a test lens named `{lid}`: {title}.
+
+You are reviewing work another agent just finished. You did not write it, you
+have no stake in it, and you have not seen the reasoning behind it. Your job is
+to find what is actually wrong with it by running it.
+
+## Your mandate
+
+{mandate}
+
+## The work
+
+Repository: {repo}
+Base ref:   {base}
+See the change with:  git diff {base}...HEAD
+
+Changed files:
+{listing}
+{context}
+## How to work
+
+Start by reading the diff. Then run things. You have Bash, Read, Grep, Glob and
+whatever MCP tools this project has configured. You may install nothing and you
+may edit nothing — you are here to observe, not to fix.
+
+Spend your effort on reproduction, not on reading. A defect you ran is worth ten
+you suspect.
+{contract}""".format(lid=lens["id"], title=lens["title"], mandate=lens["mandate"],
+                     repo=repo, base=base, listing=listing or "  (none detected)",
+                     context=("\n## Intent\n\n%s\n" % context) if context else "",
+                     contract=FINDINGS_CONTRACT)
+
+
+def refuter_prompt(finding, repo, base):
+    return """You are a refuter. Another agent claims it found a defect. Most such
+claims are wrong: misread code, a stale build, an environment quirk, or a
+prediction dressed up as an observation.
+
+Your job is to prove this one wrong. Only if you genuinely cannot — because you
+ran it yourself and saw it happen — does it stand.
+
+Repository: {repo}
+Base ref:   {base}
+
+## The claim
+
+Title:    {title}
+Severity: {severity}
+Where:    {file}:{line}
+Repro:    {repro}
+Observed: {observed}
+Expected: {expected}
+
+## What to do
+
+Run the repro command yourself in this repository. Read the code around the
+claimed location. Ask whether the observed output actually demonstrates the
+defect described, or whether it shows something else that was misinterpreted.
+{contract}""".format(repo=repo, base=base, title=finding.get("title", ""),
+                     severity=finding.get("severity", ""), file=finding.get("file", ""),
+                     line=finding.get("line", ""), repro=finding.get("repro", ""),
+                     observed=finding.get("observed", ""),
+                     expected=finding.get("expected", ""), contract=REFUTER_CONTRACT)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="ship-fanout",
+                                 description="fan out independent Claudes to break the work")
+    ap.add_argument("--repo", default=".")
+    ap.add_argument("--out", help="directory for findings (required unless --list-lenses)")
+    ap.add_argument("--base", default=None, help="base ref (default: detect)")
+    ap.add_argument("--lenses", default="auto", help="auto, or a comma list")
+    ap.add_argument("--round", type=int, default=1)
+    ap.add_argument("--concurrency", type=int, default=5)
+    ap.add_argument("--timeout", type=int, default=900, help="seconds per lens")
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--context", default=None, help="file describing the intent")
+    ap.add_argument("--no-refute", action="store_true")
+    ap.add_argument("--list-lenses", action="store_true")
+    ap.add_argument("--plan-only", action="store_true",
+                    help="print which lenses would run, then stop")
+    ap.add_argument("--max-lenses", type=int, default=7,
+                    help="ceiling per round; overflow is deferred, never dropped silently")
+    args = ap.parse_args()
+
+    if args.list_lenses:
+        for lens in LENSES:
+            trigger = "always" if lens.get("always") else ", ".join(lens.get("when", []))
+            print("%-20s %s\n%-20s   when: %s\n" % (lens["id"], lens["title"], "", trigger))
+        return 0
+
+    repo = os.path.abspath(os.path.expanduser(args.repo))
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        code, out, _ = run(["git", "rev-parse", "--show-toplevel"], cwd=repo)
+        if code != 0:
+            die("not a git repository: %s" % repo)
+        repo = out.strip()
+
+    base = args.base or detect_base(repo)
+    files = changed_files(repo, base)
+    requested = None if args.lenses == "auto" else [x.strip() for x in args.lenses.split(",") if x.strip()]
+    lenses, deferred = route(files, requested, cap=args.max_lenses)
+
+    if args.plan_only:
+        print("base:  %s" % base)
+        print("files: %d changed" % len(files))
+        print("lenses (%d): %s" % (len(lenses), ", ".join(l["id"] for l in lenses)))
+        if deferred:
+            print("deferred to next round (--max-lenses %d): %s"
+                  % (args.max_lenses, ", ".join(deferred)))
+        return 0
+
+    if not args.out:
+        die("--out is required")
+    if not shutil.which("claude"):
+        die("`claude` is not on PATH — fall back to in-session agents", 2)
+
+    out_dir = os.path.join(os.path.abspath(os.path.expanduser(args.out)),
+                           "round-%d" % args.round)
+    raw_dir = os.path.join(out_dir, "raw")
+    os.makedirs(raw_dir, exist_ok=True)
+
+    context = ""
+    if args.context and os.path.exists(args.context):
+        with open(args.context) as fh:
+            context = fh.read()[:4000]
+
+    sys.stderr.write("round %d · base %s · %d files · lenses: %s\n"
+                     % (args.round, base, len(files), ", ".join(l["id"] for l in lenses)))
+    if deferred:
+        sys.stderr.write("  deferred to a later round: %s\n" % ", ".join(deferred))
+    started = time.time()
+
+    per_lens, raw_findings = {}, []
+
+    def one_lens(lens):
+        ok, parsed, text = claude_call(lens_prompt(lens, repo, base, files, context),
+                                       repo, args.timeout, args.model)
+        with open(os.path.join(raw_dir, "%s.json" % lens["id"]), "w") as fh:
+            json.dump({"lens": lens["id"], "ok": ok, "parsed": parsed,
+                       "raw": text[:20000]}, fh, indent=2)
+        return lens, ok, parsed, text
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
+        for lens, ok, parsed, text in pool.map(one_lens, lenses):
+            lid = lens["id"]
+            if not ok:
+                per_lens[lid] = {"status": "error", "detail": text[:300], "found": 0}
+                sys.stderr.write("  %-18s ERROR  %s\n" % (lid, text[:80]))
+                continue
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("findings"), list):
+                per_lens[lid] = {"status": "unparsed", "found": 0}
+                sys.stderr.write("  %-18s no parsable findings\n" % lid)
+                continue
+            kept, dropped = [], 0
+            for finding in parsed["findings"]:
+                if valid(finding):
+                    finding["lens"] = lid
+                    kept.append(finding)
+                else:
+                    dropped += 1
+            per_lens[lid] = {"status": "ok", "found": len(kept), "dropped_no_repro": dropped}
+            raw_findings.extend(kept)
+            sys.stderr.write("  %-18s %d findings (%d dropped, no repro)\n"
+                             % (lid, len(kept), dropped))
+
+    # dedup across lenses
+    merged = {}
+    for finding in raw_findings:
+        key = fingerprint(finding)
+        if key in merged:
+            merged[key].setdefault("also_found_by", []).append(finding["lens"])
+        else:
+            finding["id"] = key
+            merged[key] = finding
+    findings = list(merged.values())
+    sys.stderr.write("merged: %d unique of %d reported\n" % (len(findings), len(raw_findings)))
+
+    # refute
+    if findings and not args.no_refute:
+        def one_refuter(finding):
+            ok, parsed, text = claude_call(refuter_prompt(finding, repo, base),
+                                           repo, min(args.timeout, 600), args.model)
+            if ok and isinstance(parsed, dict) and parsed.get("verdict") in ("confirmed", "refuted"):
+                return finding, parsed
+            return finding, {"verdict": "confirmed", "reason": "refuter inconclusive — kept",
+                             "evidence": (text or "")[:300]}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
+            for finding, verdict in pool.map(one_refuter, findings):
+                finding["verdict"] = verdict["verdict"]
+                finding["verdict_reason"] = verdict.get("reason", "")
+                finding["verdict_evidence"] = verdict.get("evidence", "")
+    else:
+        for finding in findings:
+            finding["verdict"] = "open"
+            finding["verdict_reason"] = "refutation skipped"
+
+    confirmed = [f for f in findings if f.get("verdict") == "confirmed"]
+    blockers = [f for f in confirmed if f.get("severity") in ("blocker", "high")]
+
+    with open(os.path.join(out_dir, "findings.json"), "w") as fh:
+        json.dump({"round": args.round, "base": base, "findings": findings}, fh, indent=2)
+
+    summary = {
+        "round": args.round,
+        "base": base,
+        "changed_files": len(files),
+        "lenses": per_lens,
+        "reported": len(raw_findings),
+        "unique": len(findings),
+        "confirmed": len(confirmed),
+        "blockers_and_high": len(blockers),
+        "dry": len(confirmed) == 0,
+        "deferred_lenses": deferred,
+        "seconds": round(time.time() - started, 1),
+    }
+    with open(os.path.join(out_dir, "summary.json"), "w") as fh:
+        json.dump(summary, fh, indent=2)
+
+    sys.stderr.write("confirmed %d (%d blocker/high) in %.0fs -> %s\n"
+                     % (len(confirmed), len(blockers), summary["seconds"], out_dir))
+    print(json.dumps(summary, indent=2))
+    return 1 if confirmed else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

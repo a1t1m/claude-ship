@@ -1,0 +1,866 @@
+#!/usr/bin/env python3
+"""
+ship-ui: render a decision gate as a real window, take the answers back.
+
+A gate is a `review.json` describing what the agent found, what it intends, and
+what it still needs decided. This serves that as a local page, opens a
+chromeless browser window on it, and accepts the answers over POST so they land
+in `answers.json` + `ANSWERS.md` without anyone copying anything.
+
+    ship-ui <dir> [--no-open] [--print-url] [--port N] [--timeout SECONDS]
+
+The agent is expected to launch this in the background and then poll for
+`answers.json`. The server stops itself once answers are saved, or after
+--timeout seconds of nothing (default: no timeout).
+
+Only the standard library. python3 is the single requirement.
+
+review.json — every key optional except `title`:
+
+    {
+      "title":    "DEV-188  Direct Product RFQ",
+      "subtitle": "stage 1 of 5",
+      "stage":    "UNDERSTAND",
+      "meta":     {"branch": "...", "lane": "full", "id": "..."},
+      "figures":  [{"caption","claim","tone":"dim|good|bad|warn",
+                    "art":["ascii","lines"], "svg":"<svg .../>"}],
+      "notes":    [{"heading","lines":[]}],
+      "phases":   [{"id","name","state":"done|next|planned|blocked","commit",
+                    "what":[],"files":[],"proof"}],
+      "questions":[{"id","q","why":[],"multi":false,
+                    "options":[{"id","label","detail","cost"}],
+                    "rec":"option-id","rec_why":""}],
+      "findings": [{"id","lens","severity":"blocker|high|medium|low",
+                    "title","repro","observed","verdict":"confirmed|refuted|open",
+                    "file","line","status":"fixed|open"}],
+      "checks":   [{"id","label"}],
+      "actions":  [{"id","label","detail","kind":"primary|danger|normal"}],
+      "evidence": [{"path","line","note"}]
+    }
+"""
+
+import argparse
+import errno
+import html
+import http.server
+import json
+import os
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+from datetime import datetime
+
+SPEC_NAME = "review.json"
+ANSWERS_JSON = "answers.json"
+ANSWERS_MD = "ANSWERS.md"
+
+KEYS = ("figures", "notes", "phases", "questions", "findings", "checks",
+        "actions", "evidence")
+
+
+# --------------------------------------------------------------- spec io ---
+
+def load_spec(directory):
+    path = os.path.join(directory, SPEC_NAME)
+    if not os.path.exists(path):
+        sys.exit("ship-ui: no %s in %s" % (SPEC_NAME, directory))
+    try:
+        with open(path) as fh:
+            spec = json.load(fh)
+    except ValueError as exc:
+        sys.exit("ship-ui: %s is not valid JSON: %s" % (path, exc))
+    if not isinstance(spec, dict):
+        sys.exit("ship-ui: %s must be a JSON object" % path)
+    spec.setdefault("title", "review")
+    spec.setdefault("subtitle", "")
+    spec.setdefault("stage", "")
+    spec.setdefault("meta", {})
+    for key in KEYS:
+        value = spec.get(key)
+        spec[key] = value if isinstance(value, list) else []
+    return spec
+
+
+def load_answers(directory):
+    blank = {"answers": {}, "notes": {}, "checks": {}, "action": None}
+    path = os.path.join(directory, ANSWERS_JSON)
+    if not os.path.exists(path):
+        return blank
+    try:
+        with open(path) as fh:
+            saved = json.load(fh)
+    except (ValueError, OSError):
+        return blank
+    out = dict(blank)
+    for key in ("answers", "notes", "checks"):
+        if isinstance(saved.get(key), dict):
+            out[key] = saved[key]
+    if isinstance(saved.get("action"), str):
+        out["action"] = saved["action"]
+    return out
+
+
+def option_label(question, option_id):
+    for opt in question.get("options", []) or []:
+        if opt.get("id") == option_id:
+            return opt.get("label", option_id)
+    return option_id
+
+
+def write_answers(directory, spec, payload):
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    record = {
+        "saved_at": stamp,
+        "title": spec.get("title", ""),
+        "stage": spec.get("stage", ""),
+        "answers": payload.get("answers", {}) or {},
+        "notes": payload.get("notes", {}) or {},
+        "checks": payload.get("checks", {}) or {},
+        "action": payload.get("action"),
+    }
+    with open(os.path.join(directory, ANSWERS_JSON), "w") as fh:
+        json.dump(record, fh, indent=2)
+        fh.write("\n")
+
+    lines = ["# Answers — %s" % spec.get("title", "review"), ""]
+    if spec.get("stage"):
+        lines.append("Stage: **%s**" % spec["stage"])
+    lines.append("Saved: %s" % stamp)
+    lines.append("")
+
+    questions = spec.get("questions") or []
+    if questions:
+        lines.append("## Decisions")
+        lines.append("")
+        for question in questions:
+            qid = question.get("id") or ""
+            chosen = record["answers"].get(qid)
+            note = (record["notes"].get(qid) or "").strip()
+            lines.append("### %s — %s" % (qid, question.get("q", "")))
+            if chosen is None or chosen == "" or chosen == []:
+                lines.append("")
+                lines.append("**UNANSWERED**")
+            elif isinstance(chosen, list):
+                labels = [option_label(question, c) for c in chosen]
+                lines.append("")
+                lines.append("**Chose:** %s" % ", ".join(labels))
+            else:
+                lines.append("")
+                lines.append("**Chose:** %s  `%s`"
+                             % (option_label(question, chosen), chosen))
+                rec = question.get("rec")
+                if rec and rec != chosen:
+                    lines.append("")
+                    lines.append("_(overrode the recommendation `%s`)_" % rec)
+            if note:
+                lines.append("")
+                for nline in note.splitlines():
+                    lines.append("> %s" % nline)
+            lines.append("")
+
+    checks = spec.get("checks") or []
+    if checks:
+        lines.append("## Checks")
+        lines.append("")
+        for check in checks:
+            cid = check.get("id") or ""
+            mark = "x" if record["checks"].get(cid) else " "
+            lines.append("- [%s] %s" % (mark, check.get("label", cid)))
+        lines.append("")
+
+    if record["action"]:
+        chosen = record["action"]
+        label = chosen
+        for action in spec.get("actions") or []:
+            if action.get("id") == chosen:
+                label = action.get("label", chosen)
+        lines.append("## Gate decision")
+        lines.append("")
+        lines.append("**%s**  `%s`" % (label, chosen))
+        lines.append("")
+
+    with open(os.path.join(directory, ANSWERS_MD), "w") as fh:
+        fh.write("\n".join(lines).rstrip() + "\n")
+
+
+# ------------------------------------------------------------------ page ---
+
+PAGE = r"""<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root {
+  --bg:#0e1014; --panel:#161a21; --panel-2:#1c212a; --line:#272e39;
+  --ink:#e8ecf2; --ink-dim:#98a3b3; --ink-faint:#6b7686;
+  --accent:#7aa2f7; --accent-ink:#0e1014;
+  --good:#7ee787; --bad:#ff7b72; --warn:#e3b341; --info:#a5d6ff;
+  --radius:10px;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+}
+html[data-theme="light"] {
+  --bg:#f6f7f9; --panel:#ffffff; --panel-2:#f0f2f5; --line:#dde1e7;
+  --ink:#11151b; --ink-dim:#59616e; --ink-faint:#8a93a0;
+  --accent:#2f5fd0; --accent-ink:#ffffff;
+  --good:#1a7f37; --bad:#cf222e; --warn:#9a6700; --info:#0969da;
+}
+* { box-sizing:border-box; }
+body {
+  margin:0; background:var(--bg); color:var(--ink);
+  font-family:var(--sans); font-size:14.5px; line-height:1.55;
+  -webkit-font-smoothing:antialiased;
+}
+a { color:var(--accent); }
+.wrap { max-width:980px; margin:0 auto; padding:0 20px 160px; }
+
+/* ---- header ---- */
+header {
+  position:sticky; top:0; z-index:50; background:var(--bg);
+  border-bottom:1px solid var(--line);
+}
+.hd { max-width:980px; margin:0 auto; padding:14px 20px;
+      display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+.hd h1 { font-size:16px; margin:0; font-weight:640; letter-spacing:-0.01em; }
+.hd .sub { color:var(--ink-faint); font-size:12.5px; font-family:var(--mono); }
+.chip {
+  font-family:var(--mono); font-size:11px; letter-spacing:0.09em;
+  text-transform:uppercase; padding:3px 8px; border-radius:999px;
+  border:1px solid var(--line); color:var(--ink-dim); background:var(--panel);
+  white-space:nowrap;
+}
+.chip.stage { border-color:var(--accent); color:var(--accent); }
+.spacer { flex:1 1 auto; }
+.progress { font-family:var(--mono); font-size:12px; color:var(--ink-dim); }
+.progress b { color:var(--ink); }
+.iconbtn {
+  background:var(--panel); border:1px solid var(--line); color:var(--ink-dim);
+  border-radius:8px; padding:5px 9px; cursor:pointer; font-size:13px;
+}
+.iconbtn:hover { color:var(--ink); border-color:var(--ink-faint); }
+
+/* ---- nav ---- */
+nav { display:flex; gap:4px; padding:0 20px 10px; max-width:980px;
+      margin:0 auto; flex-wrap:wrap; }
+nav a {
+  font-family:var(--mono); font-size:11.5px; text-transform:uppercase;
+  letter-spacing:0.07em; color:var(--ink-faint); text-decoration:none;
+  padding:4px 9px; border-radius:6px;
+}
+nav a:hover { color:var(--ink); background:var(--panel); }
+
+/* ---- sections ---- */
+section { margin:34px 0 0; scroll-margin-top:104px; }
+.shead {
+  display:flex; align-items:baseline; gap:10px; margin:0 0 14px;
+  border-bottom:1px solid var(--line); padding-bottom:8px;
+}
+.shead h2 {
+  font-family:var(--mono); font-size:12px; font-weight:600; margin:0;
+  text-transform:uppercase; letter-spacing:0.12em; color:var(--ink-dim);
+}
+.shead .count { font-family:var(--mono); font-size:11.5px; color:var(--ink-faint); }
+
+.card {
+  background:var(--panel); border:1px solid var(--line);
+  border-radius:var(--radius); padding:16px 18px; margin:0 0 12px;
+}
+
+/* ---- figures ---- */
+.fig .claim { font-weight:600; margin:0 0 10px; letter-spacing:-0.01em; }
+.fig pre {
+  font-family:var(--mono); font-size:12.5px; line-height:1.45; margin:0;
+  overflow-x:auto; padding:14px; background:var(--panel-2);
+  border-radius:8px; border:1px solid var(--line); color:var(--ink-dim);
+}
+.fig .svgbox { overflow-x:auto; padding:8px 0; }
+.fig .svgbox svg { max-width:100%; height:auto; display:block; }
+.fig .cap { color:var(--ink-faint); font-size:12.5px; margin:10px 0 0; }
+.fig.good { border-left:3px solid var(--good); }
+.fig.bad  { border-left:3px solid var(--bad); }
+.fig.warn { border-left:3px solid var(--warn); }
+
+/* ---- notes ---- */
+.note h3 { font-size:13.5px; margin:0 0 6px; }
+.note ul { margin:0; padding-left:18px; color:var(--ink-dim); }
+
+/* ---- phases ---- */
+.phase { display:grid; grid-template-columns:78px 1fr; gap:14px; }
+.pstate {
+  font-family:var(--mono); font-size:10.5px; letter-spacing:0.09em;
+  text-transform:uppercase; padding:3px 0; text-align:center;
+  border-radius:5px; height:fit-content; border:1px solid var(--line);
+  color:var(--ink-faint);
+}
+.pstate.done    { color:var(--good); border-color:var(--good); }
+.pstate.next    { color:var(--accent); border-color:var(--accent); }
+.pstate.blocked { color:var(--bad); border-color:var(--bad); }
+.phase h3 { font-size:14px; margin:0 0 6px; }
+.phase ul { margin:0 0 8px; padding-left:18px; color:var(--ink-dim); }
+.files { font-family:var(--mono); font-size:11.5px; color:var(--ink-faint);
+         word-break:break-all; }
+.proof { font-family:var(--mono); font-size:11.5px; color:var(--info);
+         margin-top:6px; }
+
+/* ---- questions ---- */
+.q { border-left:3px solid var(--line); }
+.q.answered { border-left-color:var(--good); }
+.q.focus { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+.q .qid { font-family:var(--mono); font-size:11px; color:var(--ink-faint); }
+.q h3 { font-size:15.5px; margin:4px 0 10px; letter-spacing:-0.01em; }
+.why { margin:0 0 12px; padding:10px 12px; background:var(--panel-2);
+       border-radius:8px; }
+.why ul { margin:0; padding-left:18px; color:var(--ink-dim); font-size:13px; }
+.opts { display:flex; flex-direction:column; gap:7px; }
+.opt {
+  display:grid; grid-template-columns:22px 1fr; gap:10px; align-items:start;
+  padding:11px 13px; border:1px solid var(--line); border-radius:8px;
+  cursor:pointer; background:var(--bg); transition:border-color .1s;
+}
+.opt:hover { border-color:var(--ink-faint); }
+.opt.sel { border-color:var(--accent); background:var(--panel-2); }
+.dot {
+  width:16px; height:16px; border-radius:50%; border:1.5px solid var(--ink-faint);
+  margin-top:2px; position:relative; flex:none;
+}
+.opt.multi .dot { border-radius:4px; }
+.opt.sel .dot { border-color:var(--accent); }
+.opt.sel .dot:after {
+  content:""; position:absolute; inset:3px; border-radius:inherit;
+  background:var(--accent);
+}
+.opt .lab { font-weight:560; }
+.opt .num {
+  font-family:var(--mono); font-size:10.5px; color:var(--ink-faint);
+  border:1px solid var(--line); border-radius:4px; padding:0 4px; margin-right:7px;
+}
+.opt .det { color:var(--ink-dim); font-size:13px; margin-top:3px; }
+.opt .cost { font-family:var(--mono); font-size:11.5px; color:var(--warn);
+             margin-top:4px; }
+.recbadge {
+  font-family:var(--mono); font-size:10px; letter-spacing:0.08em;
+  text-transform:uppercase; color:var(--accent-ink); background:var(--accent);
+  border-radius:4px; padding:1px 6px; margin-left:8px; vertical-align:1px;
+}
+.recwhy { color:var(--ink-faint); font-size:12.5px; margin:10px 0 0;
+          font-style:italic; }
+textarea {
+  width:100%; margin-top:10px; background:var(--bg); color:var(--ink);
+  border:1px solid var(--line); border-radius:8px; padding:9px 11px;
+  font-family:var(--sans); font-size:13.5px; resize:vertical; min-height:38px;
+}
+textarea:focus { outline:none; border-color:var(--accent); }
+
+/* ---- findings ---- */
+.finding { display:grid; grid-template-columns:84px 1fr; gap:14px; }
+.sev {
+  font-family:var(--mono); font-size:10.5px; letter-spacing:0.08em;
+  text-transform:uppercase; text-align:center; padding:3px 0; border-radius:5px;
+  height:fit-content; border:1px solid var(--line); color:var(--ink-faint);
+}
+.sev.blocker,.sev.high { color:var(--bad); border-color:var(--bad); }
+.sev.medium { color:var(--warn); border-color:var(--warn); }
+.finding h3 { font-size:14px; margin:0 0 6px; }
+.finding .lens { font-family:var(--mono); font-size:11px; color:var(--ink-faint); }
+.finding pre {
+  font-family:var(--mono); font-size:11.5px; margin:8px 0 0; padding:9px 11px;
+  background:var(--panel-2); border-radius:6px; border:1px solid var(--line);
+  overflow-x:auto; color:var(--ink-dim);
+}
+.tag { font-family:var(--mono); font-size:10px; text-transform:uppercase;
+       letter-spacing:0.07em; padding:1px 6px; border-radius:4px;
+       border:1px solid var(--line); color:var(--ink-faint); margin-left:6px; }
+.tag.fixed { color:var(--good); border-color:var(--good); }
+.tag.confirmed { color:var(--bad); border-color:var(--bad); }
+
+/* ---- checks ---- */
+.check { display:flex; gap:11px; align-items:center; padding:8px 0;
+         cursor:pointer; }
+.box { width:16px; height:16px; border-radius:4px; border:1.5px solid var(--ink-faint);
+       position:relative; flex:none; }
+.check.on .box { border-color:var(--good); }
+.check.on .box:after { content:""; position:absolute; inset:3px; border-radius:2px;
+                       background:var(--good); }
+.check.on span { color:var(--ink-dim); text-decoration:line-through; }
+
+/* ---- evidence ---- */
+.ev { font-family:var(--mono); font-size:12px; color:var(--ink-dim);
+      padding:5px 0; border-bottom:1px solid var(--line); }
+.ev b { color:var(--info); font-weight:500; }
+
+/* ---- save bar ---- */
+.savebar {
+  position:fixed; left:0; right:0; bottom:0; z-index:60;
+  background:var(--panel); border-top:1px solid var(--line);
+  padding:12px 20px;
+}
+.savein { max-width:980px; margin:0 auto; display:flex; gap:10px;
+          align-items:center; flex-wrap:wrap; }
+.kbd { font-family:var(--mono); font-size:11px; color:var(--ink-faint); }
+.kbd b { color:var(--ink-dim); border:1px solid var(--line); border-radius:4px;
+         padding:1px 5px; font-weight:500; }
+button.act {
+  border:1px solid var(--line); background:var(--panel-2); color:var(--ink);
+  border-radius:8px; padding:9px 15px; font-size:13.5px; cursor:pointer;
+  font-family:var(--sans);
+}
+button.act:hover { border-color:var(--ink-faint); }
+button.act.primary { background:var(--accent); color:var(--accent-ink);
+                     border-color:var(--accent); font-weight:600; }
+button.act.danger { color:var(--bad); border-color:var(--bad); }
+button.act[disabled] { opacity:.45; cursor:not-allowed; }
+.done { text-align:center; padding:70px 20px; }
+.done h2 { font-size:19px; margin:0 0 8px; }
+.done p { color:var(--ink-dim); margin:0; }
+@media (max-width:640px) {
+  .phase,.finding { grid-template-columns:1fr; }
+  .pstate,.sev { width:84px; }
+}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+const SPEC = __SPEC__;
+const SAVED = __SAVED__;
+
+const state = {
+  answers: Object.assign({}, SAVED.answers || {}),
+  notes:   Object.assign({}, SAVED.notes   || {}),
+  checks:  Object.assign({}, SAVED.checks  || {}),
+  action:  SAVED.action || null,
+  focus:   0,
+  saved:   false,
+};
+
+const esc = s => String(s == null ? "" : s)
+  .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+  .replace(/"/g,"&quot;");
+
+const questions = SPEC.questions || [];
+const answeredCount = () => questions.filter(q => {
+  const v = state.answers[q.id];
+  return Array.isArray(v) ? v.length > 0 : (v !== undefined && v !== null && v !== "");
+}).length;
+
+function figuresHTML() {
+  if (!(SPEC.figures || []).length) return "";
+  return section("map", "Map", SPEC.figures.map(f => `
+    <div class="card fig ${esc(f.tone || "")}">
+      ${f.claim ? `<p class="claim">${esc(f.claim)}</p>` : ""}
+      ${f.svg ? `<div class="svgbox">${f.svg}</div>` : ""}
+      ${(f.art && f.art.length) ? `<pre>${esc(f.art.join("\n"))}</pre>` : ""}
+      ${f.caption ? `<p class="cap">${esc(f.caption)}</p>` : ""}
+    </div>`).join(""));
+}
+
+function notesHTML() {
+  if (!(SPEC.notes || []).length) return "";
+  return section("settled", "Settled", SPEC.notes.map(n => `
+    <div class="card note">
+      <h3>${esc(n.heading || "")}</h3>
+      <ul>${(n.lines || []).map(l => `<li>${esc(l)}</li>`).join("")}</ul>
+    </div>`).join(""));
+}
+
+function phasesHTML() {
+  if (!(SPEC.phases || []).length) return "";
+  return section("phases", "Phases", SPEC.phases.map(p => `
+    <div class="card phase">
+      <div class="pstate ${esc(p.state || "planned")}">${esc(p.state || "planned")}</div>
+      <div>
+        <h3>${esc(p.id ? p.id + " — " : "")}${esc(p.name || "")}
+          ${p.commit ? `<span class="tag">${esc(p.commit)}</span>` : ""}</h3>
+        ${(p.what || []).length ? `<ul>${p.what.map(w => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}
+        ${(p.files || []).length ? `<div class="files">${p.files.map(esc).join("  ·  ")}</div>` : ""}
+        ${p.proof ? `<div class="proof">proof: ${esc(p.proof)}</div>` : ""}
+      </div>
+    </div>`).join(""));
+}
+
+function findingsHTML() {
+  if (!(SPEC.findings || []).length) return "";
+  return section("findings", "Findings", SPEC.findings.map(f => `
+    <div class="card finding">
+      <div class="sev ${esc(f.severity || "low")}">${esc(f.severity || "low")}</div>
+      <div>
+        <h3>${esc(f.title || "")}
+          ${f.verdict ? `<span class="tag ${esc(f.verdict)}">${esc(f.verdict)}</span>` : ""}
+          ${f.status ? `<span class="tag ${esc(f.status)}">${esc(f.status)}</span>` : ""}</h3>
+        <div class="lens">${esc(f.lens || "")}${f.file ? " · " + esc(f.file) + (f.line ? ":" + esc(f.line) : "") : ""}</div>
+        ${f.repro ? `<pre>$ ${esc(f.repro)}${f.observed ? "\n" + esc(f.observed) : ""}</pre>` : ""}
+      </div>
+    </div>`).join(""));
+}
+
+function questionsHTML() {
+  if (!questions.length) return "";
+  const body = questions.map((q, qi) => {
+    const cur = state.answers[q.id];
+    const multi = !!q.multi;
+    const isSel = oid => multi ? (Array.isArray(cur) && cur.includes(oid)) : cur === oid;
+    const answered = multi ? (Array.isArray(cur) && cur.length) : (cur !== undefined && cur !== null && cur !== "");
+    return `
+    <div class="card q ${answered ? "answered" : ""} ${qi === state.focus ? "focus" : ""}" id="q-${esc(q.id)}">
+      <div class="qid">${esc(q.id || "")}${multi ? " · pick any" : ""}</div>
+      <h3>${esc(q.q || "")}</h3>
+      ${(q.why || []).length ? `<div class="why"><ul>${q.why.map(w => `<li>${esc(w)}</li>`).join("")}</ul></div>` : ""}
+      <div class="opts">
+        ${(q.options || []).map((o, oi) => `
+          <div class="opt ${multi ? "multi" : ""} ${isSel(o.id) ? "sel" : ""}"
+               data-q="${esc(q.id)}" data-o="${esc(o.id)}">
+            <div class="dot"></div>
+            <div>
+              <div class="lab"><span class="num">${oi + 1}</span>${esc(o.label || o.id)}${
+                q.rec === o.id ? `<span class="recbadge">rec</span>` : ""}</div>
+              ${o.detail ? `<div class="det">${esc(o.detail)}</div>` : ""}
+              ${o.cost ? `<div class="cost">cost: ${esc(o.cost)}</div>` : ""}
+            </div>
+          </div>`).join("")}
+      </div>
+      ${q.rec_why ? `<p class="recwhy">why the rec: ${esc(q.rec_why)}</p>` : ""}
+      <textarea data-note="${esc(q.id)}" placeholder="note, override, or a different idea entirely…"
+        >${esc(state.notes[q.id] || "")}</textarea>
+    </div>`;
+  }).join("");
+  return section("ask", "Decisions", body, `${answeredCount()}/${questions.length}`);
+}
+
+function checksHTML() {
+  if (!(SPEC.checks || []).length) return "";
+  return section("checks", "Checks", `<div class="card">${SPEC.checks.map(c => `
+    <div class="check ${state.checks[c.id] ? "on" : ""}" data-check="${esc(c.id)}">
+      <div class="box"></div><span>${esc(c.label || c.id)}</span>
+    </div>`).join("")}</div>`);
+}
+
+function evidenceHTML() {
+  if (!(SPEC.evidence || []).length) return "";
+  return section("evidence", "Evidence", `<div class="card">${SPEC.evidence.map(e => `
+    <div class="ev"><b>${esc(e.path || "")}${e.line ? ":" + esc(e.line) : ""}</b>${
+      e.note ? " — " + esc(e.note) : ""}</div>`).join("")}</div>`);
+}
+
+function section(id, label, body, count) {
+  return `<section id="${id}"><div class="shead"><h2>${esc(label)}</h2>${
+    count ? `<span class="count">${esc(count)}</span>` : ""}</div>${body}</section>`;
+}
+
+function navHTML() {
+  const items = [
+    ["map", "Map", (SPEC.figures || []).length],
+    ["settled", "Settled", (SPEC.notes || []).length],
+    ["phases", "Phases", (SPEC.phases || []).length],
+    ["findings", "Findings", (SPEC.findings || []).length],
+    ["ask", "Decisions", questions.length],
+    ["checks", "Checks", (SPEC.checks || []).length],
+    ["evidence", "Evidence", (SPEC.evidence || []).length],
+  ].filter(i => i[2]);
+  return `<nav>${items.map(i => `<a href="#${i[0]}">${i[1]}</a>`).join("")}</nav>`;
+}
+
+function saveBarHTML() {
+  const actions = SPEC.actions || [];
+  const acts = actions.length ? actions.map(a => `
+      <button class="act ${state.action === a.id ? "primary" : (a.kind === "danger" ? "danger" : "")}"
+              data-action="${esc(a.id)}" title="${esc(a.detail || "")}">${esc(a.label || a.id)}</button>`).join("")
+    : "";
+  const need = questions.length - answeredCount();
+  return `<div class="savebar"><div class="savein">
+    <span class="kbd"><b>1-9</b> pick &nbsp; <b>j</b>/<b>k</b> move &nbsp; <b>⌘↵</b> save</span>
+    <span class="spacer" style="flex:1"></span>
+    ${acts}
+    <button class="act primary" id="savebtn">${
+      need > 0 ? `Save &amp; hand back (${need} open)` : "Save &amp; hand back"}</button>
+  </div></div>`;
+}
+
+function render() {
+  if (state.saved) {
+    document.getElementById("app").innerHTML =
+      `<div class="done"><h2>Handed back.</h2>
+       <p>Answers written. You can close this window — the agent has them.</p></div>`;
+    return;
+  }
+  document.getElementById("app").innerHTML = `
+    <header><div class="hd">
+      <h1>${esc(SPEC.title)}</h1>
+      ${SPEC.stage ? `<span class="chip stage">${esc(SPEC.stage)}</span>` : ""}
+      ${SPEC.subtitle ? `<span class="sub">${esc(SPEC.subtitle)}</span>` : ""}
+      <span class="spacer"></span>
+      ${questions.length ? `<span class="progress"><b>${answeredCount()}</b>/${questions.length} answered</span>` : ""}
+      <button class="iconbtn" id="theme">◐</button>
+    </div>${navHTML()}</header>
+    <div class="wrap">
+      ${figuresHTML()}${notesHTML()}${phasesHTML()}${findingsHTML()}
+      ${questionsHTML()}${checksHTML()}${evidenceHTML()}
+    </div>
+    ${saveBarHTML()}`;
+  wire();
+}
+
+function wire() {
+  document.querySelectorAll(".opt").forEach(el => el.onclick = () => {
+    const qid = el.dataset.q, oid = el.dataset.o;
+    const q = questions.find(x => x.id === qid);
+    if (q && q.multi) {
+      const cur = Array.isArray(state.answers[qid]) ? state.answers[qid].slice() : [];
+      const at = cur.indexOf(oid);
+      if (at >= 0) cur.splice(at, 1); else cur.push(oid);
+      state.answers[qid] = cur;
+    } else {
+      state.answers[qid] = state.answers[qid] === oid ? undefined : oid;
+    }
+    state.focus = questions.findIndex(x => x.id === qid);
+    render();
+  });
+  document.querySelectorAll("[data-note]").forEach(el => {
+    el.oninput = () => { state.notes[el.dataset.note] = el.value; };
+  });
+  document.querySelectorAll("[data-check]").forEach(el => el.onclick = () => {
+    const id = el.dataset.check;
+    state.checks[id] = !state.checks[id];
+    render();
+  });
+  document.querySelectorAll("[data-action]").forEach(el => el.onclick = () => {
+    state.action = el.dataset.action; render();
+  });
+  const sb = document.getElementById("savebtn");
+  if (sb) sb.onclick = save;
+  const th = document.getElementById("theme");
+  if (th) th.onclick = () => {
+    const root = document.documentElement;
+    root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark";
+  };
+}
+
+document.addEventListener("keydown", e => {
+  if (state.saved) return;
+  const typing = /^(TEXTAREA|INPUT)$/.test(document.activeElement.tagName);
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); save(); return; }
+  if (typing) return;
+  if (e.key === "j" || e.key === "ArrowDown") {
+    state.focus = Math.min(state.focus + 1, questions.length - 1); scrollFocus(); return;
+  }
+  if (e.key === "k" || e.key === "ArrowUp") {
+    state.focus = Math.max(state.focus - 1, 0); scrollFocus(); return;
+  }
+  if (/^[1-9]$/.test(e.key) && questions[state.focus]) {
+    const q = questions[state.focus];
+    const opt = (q.options || [])[parseInt(e.key, 10) - 1];
+    if (!opt) return;
+    if (q.multi) {
+      const cur = Array.isArray(state.answers[q.id]) ? state.answers[q.id].slice() : [];
+      const at = cur.indexOf(opt.id);
+      if (at >= 0) cur.splice(at, 1); else cur.push(opt.id);
+      state.answers[q.id] = cur;
+    } else { state.answers[q.id] = opt.id; }
+    render();
+  }
+});
+
+function scrollFocus() {
+  render();
+  const q = questions[state.focus];
+  if (!q) return;
+  const el = document.getElementById("q-" + q.id);
+  if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function save() {
+  fetch("/save", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      answers: state.answers, notes: state.notes,
+      checks: state.checks, action: state.action,
+    }),
+  }).then(() => { state.saved = true; render(); })
+    .catch(() => alert("Could not hand the answers back — is the agent still running?"));
+}
+
+render();
+</script>
+</body>
+</html>
+"""
+
+
+def build_page(spec, saved):
+    page = PAGE
+    page = page.replace("__TITLE__", html.escape(str(spec.get("title", "review"))))
+    page = page.replace("__SPEC__", json.dumps(spec))
+    page = page.replace("__SAVED__", json.dumps(saved))
+    return page.encode("utf-8")
+
+
+# ---------------------------------------------------------------- server ---
+
+class Gate:
+    def __init__(self, directory, spec, saved):
+        self.directory = directory
+        self.spec = spec
+        self.saved = saved
+        self.body = build_page(spec, saved)
+        self.done = threading.Event()
+
+
+def make_handler(gate):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def _send(self, code, body, ctype):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def do_GET(self):
+            if self.path in ("/", "/index.html"):
+                self._send(200, gate.body, "text/html; charset=utf-8")
+            elif self.path == "/health":
+                self._send(200, b"ok", "text/plain")
+            else:
+                self._send(404, b"not found", "text/plain")
+
+        def do_POST(self):
+            if self.path != "/save":
+                self._send(404, b"not found", "text/plain")
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, TypeError):
+                self._send(400, b'{"ok":false}', "application/json")
+                return
+            try:
+                write_answers(gate.directory, gate.spec, payload)
+            except OSError as exc:
+                self._send(500, json.dumps({"ok": False, "error": str(exc)}).encode(),
+                           "application/json")
+                return
+            self._send(200, b'{"ok":true}', "application/json")
+            threading.Timer(0.5, gate.done.set).start()
+
+    return Handler
+
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def free_port(preferred=0):
+    if preferred:
+        try:
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", preferred))
+            return preferred
+        except OSError as exc:
+            if exc.errno not in (errno.EADDRINUSE, errno.EACCES):
+                raise
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+APP_BROWSERS = [
+    "/Applications/Google Chrome.app",
+    "/Applications/Brave Browser.app",
+    "/Applications/Microsoft Edge.app",
+    "/Applications/Arc.app",
+    "/Applications/Chromium.app",
+]
+
+
+def open_window(url):
+    """Chromeless app window where possible, ordinary tab otherwise."""
+    if sys.platform == "darwin":
+        for app in APP_BROWSERS:
+            if os.path.isdir(app):
+                try:
+                    subprocess.Popen(
+                        ["open", "-na", app, "--args", "--app=" + url,
+                         "--window-size=1120,900"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return True
+                except OSError:
+                    break
+    for binary in ("google-chrome", "chromium", "brave-browser", "microsoft-edge"):
+        try:
+            subprocess.Popen([binary, "--app=" + url],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except (OSError, FileNotFoundError):
+            continue
+    try:
+        return webbrowser.open(url)
+    except Exception:
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="ship-ui", description="render a decision gate, take the answers back")
+    parser.add_argument("directory", nargs="?", default=".",
+                        help="directory holding review.json (default: .)")
+    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--no-open", action="store_true",
+                        help="serve without opening a window")
+    parser.add_argument("--print-url", action="store_true",
+                        help="print the URL and keep serving")
+    parser.add_argument("--timeout", type=float, default=0,
+                        help="give up after N seconds with no answer (0 = wait)")
+    args = parser.parse_args()
+
+    directory = os.path.abspath(os.path.expanduser(args.directory))
+    if not os.path.isdir(directory):
+        sys.exit("ship-ui: not a directory: %s" % directory)
+
+    spec = load_spec(directory)
+    saved = load_answers(directory)
+    gate = Gate(directory, spec, saved)
+
+    port = free_port(args.port)
+    server = Server(("127.0.0.1", port), make_handler(gate))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    url = "http://127.0.0.1:%d/" % port
+    print("ship-ui  %s" % spec.get("title", ""))
+    print("         %s" % url)
+    print("         answers -> %s" % os.path.join(directory, ANSWERS_MD))
+    sys.stdout.flush()
+
+    if not args.no_open:
+        if not open_window(url):
+            print("         (could not open a window — open the URL above)")
+            sys.stdout.flush()
+
+    try:
+        signalled = gate.done.wait(args.timeout if args.timeout > 0 else None)
+    except KeyboardInterrupt:
+        signalled = False
+    server.shutdown()
+    if signalled:
+        print("saved")
+        return 0
+    print("timed out with no answer" if args.timeout > 0 else "interrupted")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

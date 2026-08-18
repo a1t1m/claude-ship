@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# ship-preflight: what is available, and what degrades without it.
+# Never fails the run. Prints a report and exits 0 unless a hard requirement
+# is missing (exit 1), so a caller can branch on it.
+
+set -u
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+hard_missing=0
+
+say() { printf '  %-38s %-8s %s\n' "$1" "$2" "$3"; }
+
+check() { # name  required|optional  fallback-text  command...
+  local name="$1" kind="$2" fallback="$3"; shift 3
+  if command -v "$1" >/dev/null 2>&1; then
+    say "$name" "ok" "$("$@" 2>&1 | head -1 | cut -c1-46)"
+  elif [ "$kind" = required ]; then
+    say "$name" "MISSING" "$fallback"; hard_missing=1
+  else
+    say "$name" "absent" "$fallback"
+  fi
+}
+
+echo "ship preflight — $SKILL_DIR"
+echo
+echo "  tool                                   state    detail"
+echo "  -------------------------------------- -------- ------------------"
+check python3 required "HARD REQUIREMENT — gates cannot render"      python3 --version
+check git     required "HARD REQUIREMENT — no worktree, no diff"     git --version
+check claude  optional "PROVE falls back to in-session agents"       claude --version
+check gh      optional "SHIP prints the PR body for you to paste"    gh --version
+echo
+
+echo "  skill                                  state    role"
+echo "  -------------------------------------- -------- ------------------"
+for pair in \
+  "superpowers:test-driven-development|writing code|required-ish" \
+  "superpowers:systematic-debugging|debugging failures|required-ish" \
+  "frontend-design|UI aesthetic direction|optional" \
+  "ui-ux-pro-max|UI system and patterns|optional" \
+  "emil-design-eng|UI polish and motion|optional" \
+  ; do
+  name="${pair%%|*}"; rest="${pair#*|}"; role="${rest%%|*}"
+  base="${name#*:}"
+  if [ -d "$HOME/.claude/skills/$base" ] || [ -n "$(
+       find "$HOME/.claude/plugins/cache" -maxdepth 6 -type d -name "$base" \
+            -not -path '*/tests/*' -print -quit 2>/dev/null)" ]; then
+    say "$name" "ok" "$role"
+  else
+    say "$name" "absent" "$role — continue without it"
+  fi
+done
+echo
+
+if [ -x "$SKILL_DIR/bin/ship-ui" ] && [ -x "$SKILL_DIR/bin/ship-fanout" ]; then
+  echo "  bundled: ship-ui, ship-fanout, ship-preflight — all executable"
+else
+  echo "  bundled: NOT executable — run: chmod +x \"$SKILL_DIR\"/bin/*"
+  hard_missing=1
+fi
+echo
+if [ "$hard_missing" -eq 1 ]; then
+  echo "  verdict: a hard requirement is missing — see MISSING above"
+  exit 1
+fi
+echo "  verdict: ready"
+exit 0
